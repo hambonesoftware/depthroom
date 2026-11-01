@@ -1,5 +1,8 @@
 import './style.css';
 import { DepthRenderer } from './renderer.js';
+import { CanvasFallbackRenderer } from './canvasFallbackRenderer.js';
+const MOBILE_DEVICE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && Math.min(innerWidth, innerHeight) < 1100);
 import { cancelDepthEstimation, estimateDepth, fileToCanvas, makeBasicDepth, processDepth } from './depth.js';
 import { makeInteractiveHTML } from './exportScene.js';
 
@@ -66,20 +69,28 @@ const state = {
   hasAiDepth: false,
   aiPending: false,
   recording: false,
+  usingCanvasFallback: false,
 };
 let renderer;
 let toastTimer;
 
+const angleChanged = (x, y) => {
+  elements.viewCounter.textContent = `${Math.round(x).toString().padStart(2, '0')}° / ${Math.round(y).toString().padStart(2, '0')}°`;
+};
 try {
-  renderer = new DepthRenderer(elements.sceneMount, (x, y) => {
-    elements.viewCounter.textContent = `${Math.round(x).toString().padStart(2, '0')}° / ${Math.round(y).toString().padStart(2, '0')}°`;
-  });
+  renderer = new DepthRenderer(elements.sceneMount, angleChanged);
 } catch (error) {
-  console.error(error);
-  setStatus('WebGL is unavailable', 'This browser cannot display a 3D scene.', 'error');
-  elements.viewerLoading.hidden = false;
-  elements.loadingLabel.textContent = '3D preview unavailable';
-  elements.loadingSubLabel.textContent = 'Try an up-to-date browser with WebGL support.';
+  console.warn('WebGL could not start, using 2D compatibility preview:', error);
+  try {
+    renderer = new CanvasFallbackRenderer(elements.sceneMount, angleChanged);
+    state.usingCanvasFallback = true;
+    setStatus('Compatibility preview', '2D canvas fallback active.', 'ready');
+  } catch (fallbackError) {
+    console.error(fallbackError);
+    setStatus('Preview unavailable', 'This device does not support the rendering features required.', 'error');
+    elements.viewerLoading.hidden = false;
+    elements.loadingLabel.textContent = 'Preview unavailable';
+  }
 }
 
 function toast(message) {
@@ -203,7 +214,7 @@ function makeFlatDepth() {
   return canvas;
 }
 
-async function openPhoto(file) {
+async function openPhoto(file, { forceAI = false } = {}) {
   if (!renderer || !file) return;
   cancelDepthEstimation();
   const token = ++state.token;
@@ -219,7 +230,7 @@ async function openPhoto(file) {
   setLoading(true, 'Opening your photo', 'Preparing image for private local processing…');
   setStatus('Preparing your photo', 'Images are processed in your browser.', 'busy');
   try {
-    const photoCanvas = await fileToCanvas(file);
+    const photoCanvas = await fileToCanvas(file, MOBILE_DEVICE ? 960 : 1600);
     if (token !== state.token) return;
     state.photoCanvas = photoCanvas;
     state.sourceName = file.name.replace(/\.[^.]+$/, '') || 'photo';
@@ -241,12 +252,23 @@ async function openPhoto(file) {
     setLoading(false);
     elements.progressTrack.hidden = false;
     elements.progressFill.style.width = '10%';
+    if (MOBILE_DEVICE && !forceAI) {
+      // Starting a large AI runtime automatically can make an iPhone's browser tab crash.
+      elements.progressTrack.hidden = true;
+      elements.renderLabel.textContent = state.usingCanvasFallback
+        ? 'DEPTHROOM / CANVAS PREVIEW' : 'DEPTHROOM / QUICK DEPTH';
+      setStatus('Mobile preview ready',
+        'Your photo is ready. AI Enhance is optional on phones.', 'ready');
+      elements.fallbackBtn.hidden = false;
+      elements.fallbackBtn.textContent = 'AI Enhance (optional) →';
+      return;
+    }
     setStatus('Refining depth with AI', 'You can explore the quick preview while the model works.', 'busy');
     state.aiPending = true;
     elements.fallbackBtn.hidden = false;
     elements.fallbackBtn.textContent = 'Use quick depth now →';
     const onProgress = ({ percent, detail }) => {
-      if (token !== state.token) return;
+      if (token !== state.token || !state.aiPending) return;
       if (typeof percent === 'number') {
         elements.progressFill.style.width = `${Math.max(10, percent)}%`;
       }
@@ -258,12 +280,15 @@ async function openPhoto(file) {
     let depth;
     try {
       const inferenceCanvas = document.createElement('canvas');
-      const maxSide = 512;
+      const maxSide = MOBILE_DEVICE ? 280 : 512;
       const scale = Math.min(1, maxSide / Math.max(photoCanvas.width, photoCanvas.height));
       inferenceCanvas.width = Math.max(1, Math.round(photoCanvas.width * scale));
       inferenceCanvas.height = Math.max(1, Math.round(photoCanvas.height * scale));
       inferenceCanvas.getContext('2d').drawImage(photoCanvas, 0, 0, inferenceCanvas.width, inferenceCanvas.height);
-      depth = await estimateDepth(inferenceCanvas.toDataURL('image/jpeg', .85), onProgress);
+      const prepared = inferenceCanvas.toDataURL('image/jpeg', MOBILE_DEVICE ? .75 : .85);
+      inferenceCanvas.width = 0;
+      inferenceCanvas.height = 0;
+      depth = await estimateDepth(prepared, onProgress);
       if (token !== state.token || !state.aiPending) return;
       state.aiPending = false;
       state.hasAiDepth = true;
@@ -419,7 +444,7 @@ elements.fallbackBtn.addEventListener('click', () => {
   }
   if (state.photoCanvas) {
     const image = new File([dataURLToBlob(state.photoCanvas.toDataURL('image/jpeg', .94))], `${safeName()}.jpg`, { type: 'image/jpeg' });
-    openPhoto(image);
+    openPhoto(image, { forceAI: true });
   }
 });
 

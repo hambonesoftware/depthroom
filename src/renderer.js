@@ -1,13 +1,20 @@
 import * as THREE from 'three';
 
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const lowMemoryDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && Math.min(innerWidth, innerHeight) < 1100);
 
 export class DepthRenderer {
   constructor(mount, onAngle) {
     this.mount = mount;
     this.onAngle = onAngle;
-    this.renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    this.renderer = new THREE.WebGLRenderer({
+      alpha: true,
+      antialias: !lowMemoryDevice,
+      preserveDrawingBuffer: true,
+      powerPreference: lowMemoryDevice ? 'low-power' : 'high-performance',
+    });
+    this.renderer.setPixelRatio(lowMemoryDevice ? 1 : Math.min(2, window.devicePixelRatio || 1));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.setClearColor(0x101820, 0);
     this.renderer.domElement.setAttribute('aria-label', 'Drag to tilt the image in 3D');
@@ -91,13 +98,15 @@ export class DepthRenderer {
     const aspect = imageCanvas.width / imageCanvas.height;
     this.meshHeight = 4;
     this.meshWidth = 4 * aspect;
-    const maxSeg = 210;
-    const segX = Math.max(90, Math.min(maxSeg, Math.round(155 * Math.sqrt(aspect))));
-    const segY = Math.max(90, Math.min(maxSeg, Math.round(155 / Math.sqrt(aspect))));
+    const maxSeg = lowMemoryDevice ? 112 : 210;
+    const minSeg = lowMemoryDevice ? 42 : 90;
+    const targetSeg = lowMemoryDevice ? 80 : 155;
+    const segX = Math.max(minSeg, Math.min(maxSeg, Math.round(targetSeg * Math.sqrt(aspect))));
+    const segY = Math.max(minSeg, Math.min(maxSeg, Math.round(targetSeg / Math.sqrt(aspect))));
     const geometry = new THREE.PlaneGeometry(this.meshWidth, this.meshHeight, segX, segY);
     const imageTexture = new THREE.CanvasTexture(imageCanvas);
     imageTexture.colorSpace = THREE.SRGBColorSpace;
-    imageTexture.anisotropy = Math.min(this.renderer.capabilities.getMaxAnisotropy(), 8);
+    imageTexture.anisotropy = lowMemoryDevice ? 1 : Math.min(this.renderer.capabilities.getMaxAnisotropy(), 8);
     const material = new THREE.MeshBasicMaterial({ map: imageTexture, side: THREE.DoubleSide });
     this.mesh = new THREE.Mesh(geometry, material);
     this.scene.add(this.mesh);
@@ -162,6 +171,7 @@ export class DepthRenderer {
 
   animate(time) {
     this.animationFrame = requestAnimationFrame(this.animate);
+    if (document.hidden || this.mount.hidden || !this.mount.isConnected) return;
     if (this.mesh) {
       const sinceInteraction = time - this.lastInteraction;
       let targetX = this.pointer.x;
