@@ -1,96 +1,93 @@
-/** Depth Anything V2 runs completely in the client via Transformers.js. */
-const MODEL_ID = 'onnx-community/depth-anything-v2-small';
-let estimatorPromise = null;
+/** Depth inference is isolated in a disposable worker to protect the UI thread. */
+let activeRun = null;
 
-async function makeEstimator(onProgress = () => {}) {
-  const { pipeline, env } = await import('@huggingface/transformers');
-  env.allowRemoteModels = true;
-  // The model files are fetched from Hugging Face, not a photo-processing API.
-  const options = (device) => ({
-    device,
-    progress_callback: (event) => {
-      if (event.status === 'progress' && typeof event.progress === 'number') {
-        onProgress({ percent: Math.min(99, Math.max(0, event.progress)), detail: 'Downloading AI model…' });
-      } else if (event.status === 'ready') {
-        onProgress({ percent: 100, detail: 'Model ready' });
-      } else if (event.status === 'initiate' || event.status === 'download') {
-        onProgress({ percent: null, detail: 'Loading AI model…' });
-      }
-    },
-  });
-  if (typeof navigator !== 'undefined' && navigator.gpu) {
-    try {
-      const adapter = await navigator.gpu.requestAdapter();
-      if (adapter) {
-        onProgress({ percent: null, detail: 'Starting GPU depth estimation…' });
-        return await pipeline('depth-estimation', MODEL_ID, options('webgpu'));
-      }
-    } catch (err) {
-      console.warn('WebGPU unavailable, switching to WASM', err);
-    }
-  }
-  onProgress({ percent: null, detail: 'Loading CPU depth estimation…' });
-  return pipeline('depth-estimation', MODEL_ID, options('wasm'));
+export function cancelDepthEstimation() {
+  if (!activeRun) return;
+  const previous = activeRun;
+  activeRun = null;
+  previous.reject(new DOMException('Depth estimation cancelled.', 'AbortError'));
 }
 
-export async function estimateDepth(imageURL, onProgress = () => {}) {
-  if (!estimatorPromise) {
-    estimatorPromise = makeEstimator(onProgress).catch((error) => {
-      estimatorPromise = null;
-      throw error;
-    });
-  }
-  const estimator = await estimatorPromise;
-  onProgress({ percent: null, detail: 'Estimating foreground and background…' });
-  const prediction = await estimator(imageURL);
-  const depth = Array.isArray(prediction) ? prediction[0] : prediction;
-  if (!depth) throw new Error('The AI model returned no depth information.');
-
-  const output = depth.depth;
-  if (output && output.width && output.height && output.data) {
-    const { width, height, channels, data } = output;
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const rgba = ctx.createImageData(width, height);
-    const stride = channels || Math.max(1, Math.round(data.length / (width * height)));
-    for (let i = 0; i < width * height; i += 1) {
-      const value = stride === 1
-        ? data[i]
-        : 0.299 * data[i * stride] + 0.587 * data[i * stride + 1] + 0.114 * data[i * stride + 2];
-      const j = i * 4;
-      rgba.data[j] = value;
-      rgba.data[j + 1] = value;
-      rgba.data[j + 2] = value;
-      rgba.data[j + 3] = 255;
+export function estimateDepth(imageURL, onProgress = () => {}) {
+  cancelDepthEstimation();
+  return new Promise((resolve, reject) => {
+    let worker;
+    try {
+      worker = new Worker(new URL('./depthWorker.js', import.meta.url), { type: 'module' });
+    } catch (error) {
+      reject(error);
+      return;
     }
-    ctx.putImageData(rgba, 0, 0);
-    return canvas;
-  }
-
-  const tensor = depth.predicted_depth;
-  if (!tensor?.data || !tensor?.dims) throw new Error('Depth output was in an unknown format.');
-  const h = tensor.dims[tensor.dims.length - 2];
-  const w = tensor.dims[tensor.dims.length - 1];
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d');
-  const image = ctx.createImageData(w, h);
-  const samples = tensor.data;
-  let min = Infinity;
-  let max = -Infinity;
-  for (let i = 0; i < samples.length; i += 1) {
-    min = Math.min(min, samples[i]);
-    max = Math.max(max, samples[i]);
-  }
-  for (let i = 0; i < w * h; i += 1) {
-    const v = Math.round(255 * (samples[i] - min) / Math.max(1e-6, max - min));
-    image.data.set([v, v, v, 255], i * 4);
-  }
-  ctx.putImageData(image, 0, 0);
-  return canvas;
+    let stageTimeout;
+    let totalTimeout;
+    let finished = false;
+    const cleanup = () => {
+      clearTimeout(stageTimeout);
+      clearTimeout(totalTimeout);
+      worker.terminate();
+    };
+    const fail = (error) => {
+      if (finished) return;
+      finished = true;
+      if (activeRun?.worker === worker) activeRun = null;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const watch = (stage) => {
+      clearTimeout(stageTimeout);
+      const limit = stage === 'estimating' ? 85000 : stage === 'starting' ? 25000 : 65000;
+      stageTimeout = setTimeout(() => fail(new Error(
+        stage === 'estimating'
+          ? 'AI inference took too long on this device.'
+          : 'The depth model stopped responding while loading.'
+      )), limit);
+    };
+    activeRun = { worker, reject: fail };
+    watch('starting');
+    totalTimeout = setTimeout(() => fail(new Error('The AI model exceeded the processing time limit.')), 140000);
+    worker.onmessage = ({ data }) => {
+      if (finished) return;
+      if (data?.type === 'progress') {
+        watch(data.stage || 'loading');
+        onProgress({ percent: data.percent, detail: data.detail });
+      } else if (data?.type === 'error') {
+        fail(new Error(data.message || 'AI depth processing failed.'));
+      } else if (data?.type === 'result') {
+        try {
+          const { width, height } = data;
+          if (!width || !height || width * height > 10000000) throw new Error('Invalid depth map resolution.');
+          const samples = new Uint8ClampedArray(data.grayscale);
+          if (samples.length !== width * height) throw new Error('Incomplete depth map.');
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          const rgba = ctx.createImageData(width, height);
+          for (let i = 0; i < samples.length; i += 1) {
+            const j = i * 4;
+            rgba.data[j] = samples[i];
+            rgba.data[j + 1] = samples[i];
+            rgba.data[j + 2] = samples[i];
+            rgba.data[j + 3] = 255;
+          }
+          ctx.putImageData(rgba, 0, 0);
+          finished = true;
+          activeRun = null;
+          cleanup();
+          resolve(canvas);
+        } catch (error) {
+          fail(error);
+        }
+      }
+    };
+    worker.onerror = (event) => fail(new Error(event.message || 'The depth worker crashed.'));
+    worker.onmessageerror = () => fail(new Error('The depth worker returned unreadable data.'));
+    try {
+      worker.postMessage({ type: 'estimate', imageURL });
+    } catch (error) {
+      fail(error);
+    }
+  });
 }
 
 export function makeBasicDepth(width, height) {

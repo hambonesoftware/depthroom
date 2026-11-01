@@ -1,6 +1,6 @@
 import './style.css';
 import { DepthRenderer } from './renderer.js';
-import { estimateDepth, fileToCanvas, makeBasicDepth, processDepth } from './depth.js';
+import { cancelDepthEstimation, estimateDepth, fileToCanvas, makeBasicDepth, processDepth } from './depth.js';
 import { makeInteractiveHTML } from './exportScene.js';
 
 const $ = (id) => document.getElementById(id);
@@ -64,6 +64,7 @@ const state = {
   sourceName: '',
   token: 0,
   hasAiDepth: false,
+  aiPending: false,
   recording: false,
 };
 let renderer;
@@ -204,12 +205,14 @@ function makeFlatDepth() {
 
 async function openPhoto(file) {
   if (!renderer || !file) return;
+  cancelDepthEstimation();
   const token = ++state.token;
   state.photoCanvas = null;
   state.rawDepthCanvas = null;
   state.processedDepthCanvas = null;
   state.sourceName = file.name;
   state.hasAiDepth = false;
+  state.aiPending = false;
   elements.fallbackBtn.hidden = true;
   setReadyActions(false);
   showView('scene');
@@ -230,29 +233,52 @@ async function openPhoto(file) {
     elements.resolutionLabel.textContent = `PROJECT / ${photoCanvas.width} × ${photoCanvas.height}`;
     elements.renderLabel.textContent = 'DEPTHROOM / PROCESSING';
     renderer.setScene(photoCanvas, makeFlatDepth());
+    // Give users a usable preview even if the AI model cannot initialize.
+    state.rawDepthCanvas = makeBasicDepth(photoCanvas.width, photoCanvas.height);
+    updateDepthPreview();
     applySettings();
-    setLoading(true, 'Building your depth map', 'The first use downloads the AI model. Later visits may use a cached copy.');
-    setStatus('AI depth in progress', 'First use may take longer while the model downloads.', 'busy');
+    setReadyActions(true);
+    setLoading(false);
+    elements.progressTrack.hidden = false;
+    elements.progressFill.style.width = '10%';
+    setStatus('Refining depth with AI', 'You can explore the quick preview while the model works.', 'busy');
+    state.aiPending = true;
+    elements.fallbackBtn.hidden = false;
+    elements.fallbackBtn.textContent = 'Use quick depth now →';
     const onProgress = ({ percent, detail }) => {
       if (token !== state.token) return;
       if (typeof percent === 'number') {
         elements.progressFill.style.width = `${Math.max(10, percent)}%`;
       }
-      if (detail) elements.loadingSubLabel.textContent = detail;
+      if (detail) {
+        elements.loadingSubLabel.textContent = detail;
+        elements.statusDetail.textContent = detail;
+      }
     };
     let depth;
     try {
-      depth = await estimateDepth(photoCanvas.toDataURL('image/jpeg', .91), onProgress);
-      if (token !== state.token) return;
+      const inferenceCanvas = document.createElement('canvas');
+      const maxSide = 512;
+      const scale = Math.min(1, maxSide / Math.max(photoCanvas.width, photoCanvas.height));
+      inferenceCanvas.width = Math.max(1, Math.round(photoCanvas.width * scale));
+      inferenceCanvas.height = Math.max(1, Math.round(photoCanvas.height * scale));
+      inferenceCanvas.getContext('2d').drawImage(photoCanvas, 0, 0, inferenceCanvas.width, inferenceCanvas.height);
+      depth = await estimateDepth(inferenceCanvas.toDataURL('image/jpeg', .85), onProgress);
+      if (token !== state.token || !state.aiPending) return;
+      state.aiPending = false;
       state.hasAiDepth = true;
+      elements.fallbackBtn.hidden = true;
+      elements.progressTrack.hidden = true;
       setStatus('AI depth map ready', 'Estimated locally. Drag the image to explore.', 'ready');
       elements.renderLabel.textContent = 'DEPTHROOM / AI DEPTH';
     } catch (error) {
-      if (token !== state.token) return;
+      if (token !== state.token || !state.aiPending) return;
+      state.aiPending = false;
       console.warn('Depth model failed:', error);
-      depth = makeBasicDepth(photoCanvas.width, photoCanvas.height);
+      depth = state.rawDepthCanvas || makeBasicDepth(photoCanvas.width, photoCanvas.height);
       state.hasAiDepth = false;
-      setStatus('Basic depth mode', 'AI unavailable in this browser. This is an approximate depth effect.', 'error');
+      elements.progressTrack.hidden = true;
+      setStatus('Basic depth mode', `${error?.message || 'AI unavailable.'} Showing an approximate depth effect.`, 'error');
       elements.renderLabel.textContent = 'DEPTHROOM / BASIC DEPTH';
       elements.fallbackBtn.hidden = false;
       elements.fallbackBtn.textContent = 'Retry AI depth →';
@@ -377,6 +403,20 @@ elements.auto.addEventListener('change', applySettings);
 elements.reset.addEventListener('click', () => setPreset('natural'));
 document.querySelectorAll('.preset').forEach((button) => button.addEventListener('click', () => setPreset(button.dataset.preset)));
 elements.fallbackBtn.addEventListener('click', () => {
+  if (state.aiPending && state.photoCanvas) {
+    state.aiPending = false;
+    cancelDepthEstimation();
+    state.rawDepthCanvas = makeBasicDepth(state.photoCanvas.width, state.photoCanvas.height);
+    state.hasAiDepth = false;
+    elements.renderLabel.textContent = 'DEPTHROOM / BASIC DEPTH';
+    setStatus('Quick depth ready', 'Approximate depth preview. Retry AI depth for more accuracy.', 'ready');
+    elements.progressTrack.hidden = true;
+    elements.fallbackBtn.textContent = 'Retry AI depth →';
+    updateDepthPreview();
+    setReadyActions(true);
+    setLoading(false);
+    return;
+  }
   if (state.photoCanvas) {
     const image = new File([dataURLToBlob(state.photoCanvas.toDataURL('image/jpeg', .94))], `${safeName()}.jpg`, { type: 'image/jpeg' });
     openPhoto(image);
