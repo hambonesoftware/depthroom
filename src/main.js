@@ -1,9 +1,9 @@
 import './style.css';
-import { DepthRenderer } from './renderer.js';
+import { LayeredDepthRenderer } from './layeredRenderer.js';
 import { CanvasFallbackRenderer } from './canvasFallbackRenderer.js';
 const MOBILE_DEVICE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
   (navigator.maxTouchPoints > 1 && Math.min(innerWidth, innerHeight) < 1100);
-import { cancelDepthEstimation, estimateDepth, fileToCanvas, makeBasicDepth, processDepth } from './depth.js';
+import { cancelDepthEstimation, estimateDepth, fileToCanvas, makeBasicDepth, processDepth, remapDepthCanvas, buildLayerPack } from './depth.js';
 import { makeInteractiveHTML } from './exportScene.js';
 
 const $ = (id) => document.getElementById(id);
@@ -54,7 +54,7 @@ const elements = {
   toast: $('toast'),
 };
 
-const DEFAULTS = { strength: 70, motion: 65, blur: 3, contrast: 100, invert: false, auto: true };
+const DEFAULTS = { strength: 95, motion: 82, blur: 2, contrast: 120, invert: false, auto: true };
 const PRESETS = {
   natural: { ...DEFAULTS },
   cinematic: { strength: 115, motion: 85, blur: 2, contrast: 130, invert: false, auto: true },
@@ -70,6 +70,8 @@ const state = {
   aiPending: false,
   recording: false,
   usingCanvasFallback: false,
+  depthFilterKey: null,
+  layerPack: null,
 };
 let renderer;
 let toastTimer;
@@ -78,7 +80,7 @@ const angleChanged = (x, y) => {
   elements.viewCounter.textContent = `${Math.round(x).toString().padStart(2, '0')}° / ${Math.round(y).toString().padStart(2, '0')}°`;
 };
 try {
-  renderer = new DepthRenderer(elements.sceneMount, angleChanged);
+  renderer = new LayeredDepthRenderer(elements.sceneMount, angleChanged);
 } catch (error) {
   console.warn('WebGL could not start, using 2D compatibility preview:', error);
   try {
@@ -156,14 +158,11 @@ function applySettings() {
   if (!renderer) return;
   const settings = currentSettings();
   renderer.setSettings({ strength: settings.strength, motion: settings.motion, auto: settings.auto });
+  // Rebuild textures only if image-processing settings change. Motion/depth
+  // sliders update transforms without allocating new GPU textures.
   if (state.rawDepthCanvas) {
-    const processed = processDepth(state.rawDepthCanvas, settings);
-    state.processedDepthCanvas = processed;
-    renderer.setDepth(processed);
-    const large = elements.depthLarge;
-    large.width = processed.width;
-    large.height = processed.height;
-    large.getContext('2d').drawImage(processed, 0, 0);
+    const key = [settings.blur, settings.contrast, settings.invert].join('|');
+    if (key !== state.depthFilterKey) updateDepthPreview();
   }
   const active = Object.keys(PRESETS).find((key) => {
     const s = PRESETS[key];
@@ -197,11 +196,19 @@ function updateDepthPreview() {
   if (!state.rawDepthCanvas || !state.photoCanvas || !renderer) return;
   const settings = currentSettings();
   const processed = processDepth(state.rawDepthCanvas, settings);
-  state.processedDepthCanvas = processed;
-  renderer.setDepth(processed);
-  elements.depthLarge.width = processed.width;
-  elements.depthLarge.height = processed.height;
-  elements.depthLarge.getContext('2d').drawImage(processed, 0, 0);
+  const remapped = remapDepthCanvas(processed);
+  state.processedDepthCanvas = remapped;
+  state.depthFilterKey = [settings.blur, settings.contrast, settings.invert].join('|');
+  elements.depthLarge.width = remapped.width;
+  elements.depthLarge.height = remapped.height;
+  elements.depthLarge.getContext('2d').drawImage(remapped, 0, 0);
+  if (state.usingCanvasFallback) {
+    renderer.setScene(state.photoCanvas);
+  } else {
+    const pack = buildLayerPack(state.photoCanvas, remapped, { mobile: MOBILE_DEVICE });
+    state.layerPack = pack;
+    renderer.setScene(pack);
+  }
 }
 
 function makeFlatDepth() {
@@ -221,6 +228,8 @@ async function openPhoto(file, { forceAI = false } = {}) {
   state.photoCanvas = null;
   state.rawDepthCanvas = null;
   state.processedDepthCanvas = null;
+  state.layerPack = null;
+  state.depthFilterKey = null;
   state.sourceName = file.name;
   state.hasAiDepth = false;
   state.aiPending = false;
@@ -243,7 +252,7 @@ async function openPhoto(file, { forceAI = false } = {}) {
     elements.emptyState.hidden = true;
     elements.resolutionLabel.textContent = `PROJECT / ${photoCanvas.width} × ${photoCanvas.height}`;
     elements.renderLabel.textContent = 'DEPTHROOM / PROCESSING';
-    renderer.setScene(photoCanvas, makeFlatDepth());
+    // The layered scene is created by updateDepthPreview below.
     // Give users a usable preview even if the AI model cannot initialize.
     state.rawDepthCanvas = makeBasicDepth(photoCanvas.width, photoCanvas.height);
     updateDepthPreview();
@@ -256,7 +265,7 @@ async function openPhoto(file, { forceAI = false } = {}) {
       // Starting a large AI runtime automatically can make an iPhone's browser tab crash.
       elements.progressTrack.hidden = true;
       elements.renderLabel.textContent = state.usingCanvasFallback
-        ? 'DEPTHROOM / CANVAS PREVIEW' : 'DEPTHROOM / QUICK DEPTH';
+        ? 'DEPTHROOM / CANVAS PREVIEW' : 'DEPTHROOM / LAYERED QUICK DEPTH';
       setStatus('Mobile preview ready',
         'Your photo is ready. AI Enhance is optional on phones.', 'ready');
       elements.fallbackBtn.hidden = false;
@@ -295,7 +304,7 @@ async function openPhoto(file, { forceAI = false } = {}) {
       elements.fallbackBtn.hidden = true;
       elements.progressTrack.hidden = true;
       setStatus('AI depth map ready', 'Estimated locally. Drag the image to explore.', 'ready');
-      elements.renderLabel.textContent = 'DEPTHROOM / AI DEPTH';
+      elements.renderLabel.textContent = 'DEPTHROOM / LAYERED AI';
     } catch (error) {
       if (token !== state.token || !state.aiPending) return;
       state.aiPending = false;
@@ -304,7 +313,7 @@ async function openPhoto(file, { forceAI = false } = {}) {
       state.hasAiDepth = false;
       elements.progressTrack.hidden = true;
       setStatus('Basic depth mode', `${error?.message || 'AI unavailable.'} Showing an approximate depth effect.`, 'error');
-      elements.renderLabel.textContent = 'DEPTHROOM / BASIC DEPTH';
+      elements.renderLabel.textContent = 'DEPTHROOM / LAYERED BASIC';
       elements.fallbackBtn.hidden = false;
       elements.fallbackBtn.textContent = 'Retry AI depth →';
       toast('AI depth was unavailable; showing an approximate depth effect.');
@@ -423,7 +432,11 @@ elements.dropzone.addEventListener('drop', (e) => {
 
 // Controls
 [elements.strength, elements.motion].forEach((slider) => slider.addEventListener('input', applySettings));
-[elements.blur, elements.contrast, elements.invert].forEach((input) => input.addEventListener('input', applySettings));
+let depthAdjustmentTimer;
+[elements.blur, elements.contrast, elements.invert].forEach((input) => input.addEventListener('input', () => {
+  clearTimeout(depthAdjustmentTimer);
+  depthAdjustmentTimer = setTimeout(applySettings, MOBILE_DEVICE ? 150 : 70);
+}));
 elements.auto.addEventListener('change', applySettings);
 elements.reset.addEventListener('click', () => setPreset('natural'));
 document.querySelectorAll('.preset').forEach((button) => button.addEventListener('click', () => setPreset(button.dataset.preset)));
@@ -433,7 +446,7 @@ elements.fallbackBtn.addEventListener('click', () => {
     cancelDepthEstimation();
     state.rawDepthCanvas = makeBasicDepth(state.photoCanvas.width, state.photoCanvas.height);
     state.hasAiDepth = false;
-    elements.renderLabel.textContent = 'DEPTHROOM / BASIC DEPTH';
+    elements.renderLabel.textContent = 'DEPTHROOM / LAYERED BASIC';
     setStatus('Quick depth ready', 'Approximate depth preview. Retry AI depth for more accuracy.', 'ready');
     elements.progressTrack.hidden = true;
     elements.fallbackBtn.textContent = 'Retry AI depth →';
