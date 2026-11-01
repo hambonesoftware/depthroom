@@ -304,7 +304,7 @@ async function openPhoto(file, { forceAI = false } = {}) {
       elements.fallbackBtn.hidden = true;
       elements.progressTrack.hidden = true;
       setStatus('AI depth map ready', 'Estimated locally. Drag the image to explore.', 'ready');
-      elements.renderLabel.textContent = 'DEPTHROOM / LAYERED AI';
+      elements.renderLabel.textContent = 'DEPTHROOM / CLEAN DEPTH';
     } catch (error) {
       if (token !== state.token || !state.aiPending) return;
       state.aiPending = false;

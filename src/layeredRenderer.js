@@ -191,17 +191,19 @@ export class LayeredDepthRenderer {
 
     const motion = this.settings.motion;
     const strength = this.settings.strength;
-    // All layers share the same neutral alignment, with different camera responses.
-    // Moving toward the viewer increases differential parallax.
+    // Restrained camera shift limits exposed inpainted areas and image ghosting.
+    // A single near-foreground image stays intact instead of splitting people
+    // across independently moving depth bands.
     for (const layer of this.layers) {
       const p = layer.parallax;
-      layer.mesh.position.x = this.smoothed.x * motion * strength * p * .34;
-      layer.mesh.position.y = this.smoothed.y * motion * strength * p * .21;
-      layer.mesh.rotation.y = -this.smoothed.x * motion * strength * p * .036;
-      layer.mesh.rotation.x = this.smoothed.y * motion * strength * p * .024;
+      const travel = MOBILE ? .72 : 1;
+      layer.mesh.position.x = this.smoothed.x * motion * strength * p * .23 * travel;
+      layer.mesh.position.y = this.smoothed.y * motion * strength * p * .15 * travel;
+      layer.mesh.rotation.y = -this.smoothed.x * motion * strength * p * .02 * travel;
+      layer.mesh.rotation.x = this.smoothed.y * motion * strength * p * .014 * travel;
     }
-    this.camera.position.x = this.smoothed.x * motion * .19;
-    this.camera.position.y = this.smoothed.y * motion * .12;
+    this.camera.position.x = this.smoothed.x * motion * (MOBILE ? .10 : .14);
+    this.camera.position.y = this.smoothed.y * motion * (MOBILE ? .07 : .10);
     this.camera.position.z = this.baseDistance / this.settings.zoom;
     this.camera.lookAt(0, 0, 0);
     this.onAngle(this.smoothed.x * motion * 14, this.smoothed.y * motion * 10);
