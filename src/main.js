@@ -5,6 +5,8 @@ const MOBILE_DEVICE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
   (navigator.maxTouchPoints > 1 && Math.min(innerWidth, innerHeight) < 1100);
 import { cancelDepthEstimation, estimateDepth, fileToCanvas, makeBasicDepth, processDepth, remapDepthCanvas, buildLayerPack } from './depth.js';
 import { makeInteractiveHTML } from './exportScene.js';
+import { composePhotoScene } from './sceneComposer.js';
+import { segmentPeople, cancelPeopleSegmentation } from './person.js';
 
 const $ = (id) => document.getElementById(id);
 const elements = {
@@ -26,6 +28,7 @@ const elements = {
   progressTrack: $('progressTrack'),
   progressFill: $('progressFill'),
   fallbackBtn: $('fallbackBtn'),
+  refinePeopleBtn: $('refinePeopleBtn'),
   viewerLoading: $('viewerLoading'),
   loadingLabel: $('loadingLabel'),
   loadingSubLabel: $('loadingSubLabel'),
@@ -72,6 +75,8 @@ const state = {
   usingCanvasFallback: false,
   depthFilterKey: null,
   layerPack: null,
+  personMask: null,
+  personPending: false,
 };
 let renderer;
 let toastTimer;
@@ -205,7 +210,7 @@ function updateDepthPreview() {
   if (state.usingCanvasFallback) {
     renderer.setScene(state.photoCanvas);
   } else {
-    const pack = buildLayerPack(state.photoCanvas, remapped, { mobile: MOBILE_DEVICE });
+    const pack = composePhotoScene(state.photoCanvas, state.personMask, { mobile: MOBILE_DEVICE });
     state.layerPack = pack;
     renderer.setScene(pack);
   }
@@ -224,11 +229,15 @@ function makeFlatDepth() {
 async function openPhoto(file, { forceAI = false } = {}) {
   if (!renderer || !file) return;
   cancelDepthEstimation();
+  cancelPeopleSegmentation();
   const token = ++state.token;
   state.photoCanvas = null;
   state.rawDepthCanvas = null;
   state.processedDepthCanvas = null;
   state.layerPack = null;
+  state.personMask = null;
+  state.personPending = false;
+  elements.refinePeopleBtn.hidden = true;
   state.depthFilterKey = null;
   state.sourceName = file.name;
   state.hasAiDepth = false;
@@ -259,6 +268,9 @@ async function openPhoto(file, { forceAI = false } = {}) {
     applySettings();
     setReadyActions(true);
     setLoading(false);
+    elements.refinePeopleBtn.hidden = false;
+    elements.refinePeopleBtn.disabled = false;
+    elements.refinePeopleBtn.textContent = '✦ Isolate people (AI) →';
     elements.progressTrack.hidden = false;
     elements.progressFill.style.width = '10%';
     if (MOBILE_DEVICE && !forceAI) {
@@ -322,6 +334,7 @@ async function openPhoto(file, { forceAI = false } = {}) {
     updateDepthPreview();
     setReadyActions(true);
     setLoading(false);
+    if (state.hasAiDepth && !state.personMask) await isolatePeople(token, true);
   } catch (error) {
     if (token !== state.token) return;
     setLoading(false);
@@ -407,6 +420,38 @@ async function recordLoop() {
     if (recorder.state !== 'inactive') recorder.stop();
   }
 }
+
+
+async function isolatePeople(token = state.token, automatic = false) {
+  if (!state.photoCanvas || state.personPending) return;
+  state.personPending = true;
+  elements.refinePeopleBtn.hidden = false;
+  elements.refinePeopleBtn.disabled = true;
+  elements.refinePeopleBtn.textContent = '✦ Finding people…';
+  try {
+    const mask = await segmentPeople(state.photoCanvas, progress => {
+      if (token === state.token) elements.statusDetail.textContent = progress;
+    });
+    if (token !== state.token) return;
+    state.personMask = mask;
+    updateDepthPreview();
+    elements.renderLabel.textContent = 'DEPTHROOM / PORTRAIT PARALLAX';
+    elements.refinePeopleBtn.hidden = true;
+    setStatus('People isolated', 'Subjects stay intact; hidden scenery is reconstructed.', 'ready');
+    if (!automatic) toast('People separated. Try dragging your photo.');
+  } catch (error) {
+    if (token !== state.token) return;
+    console.warn('Person segmentation unavailable:', error);
+    elements.refinePeopleBtn.textContent = '✦ Retry person isolation →';
+    setStatus('Photo preview ready', 'Person isolation unavailable: ' + (error?.message || 'unknown issue'), 'error');
+  } finally {
+    if (token === state.token) {
+      state.personPending = false;
+      elements.refinePeopleBtn.disabled = false;
+    }
+  }
+}
+elements.refinePeopleBtn.addEventListener('click', () => isolatePeople(state.token));
 
 // Upload / drag and drop
 [elements.emptyUpload].forEach((button) => button.addEventListener('click', () => elements.file.click()));
